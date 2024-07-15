@@ -1,24 +1,24 @@
 version: '3.8'
 
 services:
-  dev-pay-service:
-    build: .
-    ports:
-      - "50051"
-    deploy:
-      replicas: 3
-      restart_policy:
-        condition: on-failure
-    #      resources:
-    #        limits:
-    #          cpus: '2'      # Limit to 2 CPU cores
-    #          memory: '4g'   # Limit to 4GB of memory
-    environment:
-      - GOMAXPROCS=14
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
+#  dev-pay-service:
+#    build: .
+#    ports:
+#      - "50051"
+#    deploy:
+#      replicas: 1
+#      restart_policy:
+#        condition: on-failure
+#    #      resources:
+#    #        limits:
+#    #          cpus: '2'      # Limit to 2 CPU cores
+#    #          memory: '4g'   # Limit to 4GB of memory
+#    environment:
+#      - GOMAXPROCS=14
+#    ulimits:
+#      nofile:
+#        soft: 65536
+#        hard: 65536
 
   postgres:
     container_name: dev-pay-postgres

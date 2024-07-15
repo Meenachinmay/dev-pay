@@ -22,7 +22,7 @@ const _ = grpc.SupportPackageIsVersion7
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type CreateAccountServiceClient interface {
-	CreateAccounts(ctx context.Context, in *CreateAccountsRequest, opts ...grpc.CallOption) (*CreateAccountsResponse, error)
+	CreateAccount(ctx context.Context, in *CreateAccountRequest, opts ...grpc.CallOption) (*CreateAccountResponse, error)
 }
 
 type createAccountServiceClient struct {
@@ -33,9 +33,9 @@ func NewCreateAccountServiceClient(cc grpc.ClientConnInterface) CreateAccountSer
 	return &createAccountServiceClient{cc}
 }
 
-func (c *createAccountServiceClient) CreateAccounts(ctx context.Context, in *CreateAccountsRequest, opts ...grpc.CallOption) (*CreateAccountsResponse, error) {
-	out := new(CreateAccountsResponse)
-	err := c.cc.Invoke(ctx, "/payment.CreateAccountService/CreateAccounts", in, out, opts...)
+func (c *createAccountServiceClient) CreateAccount(ctx context.Context, in *CreateAccountRequest, opts ...grpc.CallOption) (*CreateAccountResponse, error) {
+	out := new(CreateAccountResponse)
+	err := c.cc.Invoke(ctx, "/payment.CreateAccountService/CreateAccount", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (c *createAccountServiceClient) CreateAccounts(ctx context.Context, in *Cre
 // All implementations must embed UnimplementedCreateAccountServiceServer
 // for forward compatibility
 type CreateAccountServiceServer interface {
-	CreateAccounts(context.Context, *CreateAccountsRequest) (*CreateAccountsResponse, error)
+	CreateAccount(context.Context, *CreateAccountRequest) (*CreateAccountResponse, error)
 	mustEmbedUnimplementedCreateAccountServiceServer()
 }
 
@@ -54,8 +54,8 @@ type CreateAccountServiceServer interface {
 type UnimplementedCreateAccountServiceServer struct {
 }
 
-func (UnimplementedCreateAccountServiceServer) CreateAccounts(context.Context, *CreateAccountsRequest) (*CreateAccountsResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method CreateAccounts not implemented")
+func (UnimplementedCreateAccountServiceServer) CreateAccount(context.Context, *CreateAccountRequest) (*CreateAccountResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateAccount not implemented")
 }
 func (UnimplementedCreateAccountServiceServer) mustEmbedUnimplementedCreateAccountServiceServer() {}
 
@@ -70,20 +70,20 @@ func RegisterCreateAccountServiceServer(s grpc.ServiceRegistrar, srv CreateAccou
 	s.RegisterService(&CreateAccountService_ServiceDesc, srv)
 }
 
-func _CreateAccountService_CreateAccounts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateAccountsRequest)
+func _CreateAccountService_CreateAccount_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateAccountRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(CreateAccountServiceServer).CreateAccounts(ctx, in)
+		return srv.(CreateAccountServiceServer).CreateAccount(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/payment.CreateAccountService/CreateAccounts",
+		FullMethod: "/payment.CreateAccountService/CreateAccount",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(CreateAccountServiceServer).CreateAccounts(ctx, req.(*CreateAccountsRequest))
+		return srv.(CreateAccountServiceServer).CreateAccount(ctx, req.(*CreateAccountRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -96,8 +96,8 @@ var CreateAccountService_ServiceDesc = grpc.ServiceDesc{
 	HandlerType: (*CreateAccountServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
-			MethodName: "CreateAccounts",
-			Handler:    _CreateAccountService_CreateAccounts_Handler,
+			MethodName: "CreateAccount",
+			Handler:    _CreateAccountService_CreateAccount_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

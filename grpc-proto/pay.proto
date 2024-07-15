@@ -27,6 +27,12 @@ message AccountResponse {
   uint64 timestamp = 13;
 }
 
+message Account {
+  uint64 id = 1;
+  uint32 ledger = 2;
+  uint32 code = 3;
+}
+
 // Define messages for transfer operations
 message Transfer {
   uint64 id = 1;
@@ -39,21 +45,15 @@ message Transfer {
 
 // Service to create accounts
 service CreateAccountService {
-  rpc CreateAccounts(CreateAccountsRequest) returns (CreateAccountsResponse) {}
+  rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse) {}
 }
 
-message Account {
-  uint64 id = 1;
-  uint32 ledger = 2;
-  uint32 code = 3;
+message CreateAccountRequest {
+   Account account = 1;
 }
 
-message CreateAccountsRequest {
-  repeated Account accounts = 1;
-}
-
-message CreateAccountsResponse {
-  repeated string results = 1;
+message CreateAccountResponse {
+  string results = 1;
 }
 
 // Service to lookup transactions/accounts

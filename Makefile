@@ -20,4 +20,4 @@ down:
 	docker-compose down
 
 run:
-	go cmd/*.go
+	go run cmd/*.go

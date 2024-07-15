@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package payment;
+
+option go_package = "/payments";
+
+// Helper type for 128-bit integers, as protobuf does not natively support them.
+message Uint128 {
+  uint64 high = 1;  // Higher 64 bits
+  uint64 low = 2;   // Lower 64 bits
+}
+
+// Updated Account message to include all fields required by TigerBeetle
+message AccountResponse {
+  Uint128 id = 1;
+  Uint128 debitsPending = 2;
+  Uint128 debitsPosted = 3;
+  Uint128 creditsPending = 4;
+  Uint128 creditsPosted = 5;
+  Uint128 userData128 = 6;
+  uint64 userData64 = 7;
+  uint32 userData32 = 8;
+  uint32 reserved = 9;
+  uint32 ledger = 10;
+  uint32 code = 11;
+  uint32 flags = 12;
+  uint64 timestamp = 13;
+}
+
+// Define messages for transfer operations
+message Transfer {
+  uint64 id = 1;
+  uint64 debitAccountId = 2;
+  uint64 creditAccountId = 3;
+  uint64 amount = 4;
+  uint32 ledger = 5;
+  uint32 code = 6;
+}
+
+// Service to create accounts
+service CreateAccountService {
+  rpc CreateAccounts(CreateAccountsRequest) returns (CreateAccountsResponse) {}
+}
+
+message Account {
+  uint64 id = 1;
+  uint32 ledger = 2;
+  uint32 code = 3;
+}
+
+message CreateAccountsRequest {
+  repeated Account accounts = 1;
+}
+
+message CreateAccountsResponse {
+  repeated string results = 1;
+}
+
+// Service to lookup transactions/accounts
+service TransactionsLookUpService {
+  rpc LookupAccounts(LookupAccountsRequest) returns (LookupAccountsResponse) {}
+}
+
+message LookupAccountsRequest {
+  repeated uint64 accountIds = 1;
+}
+
+message LookupAccountsResponse {
+  repeated AccountResponse accounts = 1;
+}
+
+// Service to create transfers
+service CreateTransferService {
+  rpc CreateTransfers(CreateTransfersRequest) returns (CreateTransfersResponse) {}
+}
+
+message CreateTransfersRequest {
+  repeated Transfer transfers = 1;
+}
+
+message CreateTransfersResponse {
+  repeated string results = 1;
+}

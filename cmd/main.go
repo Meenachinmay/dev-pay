@@ -24,9 +24,9 @@ import (
 const (
 	BatchSize    = 8190
 	QueueSize    = 100000
-	NumWorkers   = 4
+	NumWorkers   = 14
 	OpTimeout    = 5 * time.Second
-	MinBatchSize = 1000
+	MinBatchSize = 4000
 )
 
 type AccountJob struct {
@@ -62,23 +62,38 @@ func (s *createAccountServer) worker(id int) {
 	log.Printf("Worker %d started", id)
 
 	batch := make([]Account, 0, BatchSize)
+	adaptiveMinBatchSize := MinBatchSize
+	tickerInterval := 2 * time.Second
 
 	flushBatch := func() {
-		if len(batch) >= MinBatchSize {
-			log.Printf("Worker %d flushing batch of size %d", id, len(batch))
+		batchSize := len(batch)
+		if batchSize >= adaptiveMinBatchSize {
+			log.Printf("Worker %d flushing batch of size %d", id, batchSize)
 			_, cancel := context.WithTimeout(context.Background(), OpTimeout)
 			defer cancel()
 
+			start := time.Now()
 			_, err := s.client.CreateAccounts(batch)
+			duration := time.Since(start)
+
 			if err != nil {
 				log.Printf("Worker %d failed to create accounts: %v", id, err)
+			} else {
+				// Adjust adaptive parameters based on performance
+				if duration < 500*time.Millisecond && adaptiveMinBatchSize < BatchSize {
+					adaptiveMinBatchSize = min(adaptiveMinBatchSize+500, BatchSize)
+					tickerInterval = min(tickerInterval+500*time.Millisecond, 5*time.Second)
+				} else if duration > 1*time.Second && adaptiveMinBatchSize > MinBatchSize {
+					adaptiveMinBatchSize = max(adaptiveMinBatchSize-500, MinBatchSize)
+					tickerInterval = max(tickerInterval-500*time.Millisecond, 1*time.Second)
+				}
 			}
 
 			batch = batch[:0]
 		}
 	}
 
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 
 	for {
@@ -97,10 +112,11 @@ func (s *createAccountServer) worker(id int) {
 			batch = append(batch, job.Account)
 			if len(batch) >= BatchSize {
 				flushBatch()
-				ticker.Reset(1 * time.Second)
+				ticker.Reset(tickerInterval)
 			}
 		case <-ticker.C:
 			flushBatch()
+			ticker.Reset(tickerInterval)
 		case <-s.quit:
 			if len(batch) > 0 {
 				_, err := s.client.CreateAccounts(batch)

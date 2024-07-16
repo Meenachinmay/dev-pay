@@ -9,8 +9,10 @@ import (
 	tigerbeetle_go "github.com/tigerbeetle/tigerbeetle-go"
 	. "github.com/tigerbeetle/tigerbeetle-go/pkg/types"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/grpc/status"
 	"log"
 	"net"
 	"os"
@@ -24,155 +26,102 @@ import (
 type CreateAccountTask struct {
 	Task   *Account
 	Result chan interface{}
+	Ctx    context.Context
 }
 
-type LookUpAccountTask struct {
-	Task   []Account
-	Result chan interface{}
+type TigerBeetleClientPool struct {
+	clients []tigerbeetle_go.Client
+	mu      sync.Mutex
+	index   int
 }
 
-type CreateTransferTask struct {
-	Task   []Transfer
-	Result chan interface{}
+func NewTigerBeetleClientPool(size int, address string) (*TigerBeetleClientPool, error) {
+	pool := &TigerBeetleClientPool{
+		clients: make([]tigerbeetle_go.Client, size),
+	}
+
+	for i := 0; i < size; i++ {
+		client, err := tigerbeetle_go.NewClient(ToUint128(uint64(0)), []string{address}, 8192)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TigerBeetle client %d: %v", i, err)
+		}
+		pool.clients[i] = client
+	}
+
+	return pool, nil
+}
+
+func (p *TigerBeetleClientPool) GetClient() tigerbeetle_go.Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	client := p.clients[p.index]
+	p.index = (p.index + 1) % len(p.clients)
+	return client
+}
+
+func (p *TigerBeetleClientPool) Close() {
+	for _, client := range p.clients {
+		client.Close()
+	}
 }
 
 type CreateAccountWorkerPool struct {
-	tasks    chan CreateAccountTask
-	wg       sync.WaitGroup
-	tbClient tigerbeetle_go.Client
+	tasks       chan CreateAccountTask
+	clientPool  *TigerBeetleClientPool
+	workerCount int
+	wg          sync.WaitGroup
 }
 
-type LookUpAccountWorkerPool struct {
-	tasks    chan LookUpAccountTask
-	wg       sync.WaitGroup
-	tbClient tigerbeetle_go.Client
-}
-
-type CreateTransferWorkerPool struct {
-	tasks    chan CreateTransferTask
-	wg       sync.WaitGroup
-	tbClient tigerbeetle_go.Client
-}
-
-func NewCreateAccountWorkerPool(workerCount int, taskQueueSize int, client tigerbeetle_go.Client) *CreateAccountWorkerPool {
+func NewCreateAccountWorkerPool(workerCount int, taskQueueSize int, clientPool *TigerBeetleClientPool) *CreateAccountWorkerPool {
 	wp := &CreateAccountWorkerPool{
-		tasks:    make(chan CreateAccountTask, taskQueueSize),
-		tbClient: client,
+		tasks:       make(chan CreateAccountTask, taskQueueSize),
+		clientPool:  clientPool,
+		workerCount: workerCount,
 	}
 
 	for i := 0; i < workerCount; i++ {
 		wp.wg.Add(1)
-		go func(id int) {
-			defer wp.wg.Done()
-			for task := range wp.tasks {
-				res, err := wp.tbClient.CreateAccounts([]Account{*task.Task})
-				if err != nil {
-					task.Result <- fmt.Errorf("failed to create account due to TB client error: %v", err)
-					continue
-				}
+		go wp.worker(i)
+	}
 
-				for _, err := range res {
-					task.Result <- fmt.Errorf("error creating account %d: %s", err.Index, err.Result)
-				}
+	return wp
+}
 
+func (wp *CreateAccountWorkerPool) worker(id int) {
+	defer wp.wg.Done()
+	for task := range wp.tasks {
+		client := wp.clientPool.GetClient()
+		select {
+		case <-task.Ctx.Done():
+			task.Result <- fmt.Errorf("task cancelled")
+		default:
+			res, err := client.CreateAccounts([]Account{*task.Task})
+			if err != nil {
+				task.Result <- fmt.Errorf("failed to create account due to TB client error: %v", err)
+				continue
+			}
+
+			if len(res) > 0 {
+				task.Result <- fmt.Errorf("error creating account %d: %s", res[0].Index, res[0].Result)
+			} else {
 				task.Result <- "Account created successfully"
 			}
-		}(i)
+		}
 	}
-	return wp
-}
-
-func NewCreateTransferWorkerPool(workerCount int, taskQueueSize int, client tigerbeetle_go.Client) *CreateTransferWorkerPool {
-	wp := &CreateTransferWorkerPool{
-		tasks:    make(chan CreateTransferTask, taskQueueSize),
-		tbClient: client,
-	}
-
-	for i := 0; i < workerCount; i++ {
-		wp.wg.Add(1)
-		go func(id int) {
-			// logic
-			wp.wg.Done()
-		}(i)
-	}
-	return wp
-}
-
-func NewLookUpAccountWorkerPool(workerCount int, taskQueueSize int, client tigerbeetle_go.Client) *LookUpAccountWorkerPool {
-	wp := &LookUpAccountWorkerPool{
-		tasks:    make(chan LookUpAccountTask, taskQueueSize),
-		tbClient: client,
-	}
-
-	for i := 0; i < workerCount; i++ {
-		wp.wg.Add(1)
-		go func(id int) {
-			// logic
-			wp.wg.Done()
-		}(i)
-	}
-	return wp
 }
 
 func (wp *CreateAccountWorkerPool) Shutdown() {
 	close(wp.tasks)
 	wp.wg.Wait()
 }
-func (wp *CreateTransferWorkerPool) Shutdown() {
-	close(wp.tasks)
-	wp.wg.Wait()
-}
-func (wp *LookUpAccountWorkerPool) Shutdown() {
-	close(wp.tasks)
-	wp.wg.Wait()
-}
 
-// Helper function to convert a gRPC Account to a TigerBeetle Account
 func convertGrpcAccountToTigerBeetleAccount(grpcAcc *payments.Account) *Account {
 	return &Account{
 		ID:     ToUint128(grpcAcc.Id),
 		Ledger: grpcAcc.Ledger,
-		Code:   uint16(grpcAcc.Code), // Assuming Code is a uint16 in TigerBeetle definition
+		Code:   uint16(grpcAcc.Code),
 	}
 }
-
-func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.CreateAccountRequest) (*payments.CreateAccountResponse, error) {
-	resultChan := make(chan interface{})
-	tbAccount := convertGrpcAccountToTigerBeetleAccount(req.Account)
-
-	// prepare the request
-	task := &CreateAccountTask{
-		Task:   tbAccount,
-		Result: resultChan,
-	}
-
-	// submit the task to tasks channel along with result channel
-	s.accountPool.SubmitTask(*task)
-
-	// listen for the result after from createAccount worker pool
-	select {
-	case response := <-resultChan:
-		log.Printf("CreateAccount response: %v", response)
-		close(resultChan)
-		return &payments.CreateAccountResponse{Results: response.(string)}, nil
-	case <-time.After(time.Second * 5):
-		close(resultChan)
-		return nil, fmt.Errorf("CreateAccount timeout")
-	}
-
-}
-
-//func (s *lookUpAccountServer) LookupAccounts(ctx context.Context, req *payments.LookupAccountsRequest) (*payments.LookupAccountsResponse, error) {
-//	resultChan := make(chan []Account)
-//	payload, _ := json.Marshal(req)
-//
-//}
-//
-//func (s *createTransferServer) CreateTransfers(ctx context.Context, req *payments.CreateTransfersRequest) (*payments.CreateTransfersResponse, error) {
-//	resultChan := make(chan string)
-//	payload, _ := json.Marshal(req)
-//
-//}
 
 type createAccountServer struct {
 	payments.UnimplementedCreateAccountServiceServer
@@ -180,24 +129,50 @@ type createAccountServer struct {
 	circuitBreaker *gobreaker.CircuitBreaker
 }
 
-type createTransferServer struct {
-	payments.UnimplementedCreateTransferServiceServer
-	transferPool *CreateTransferWorkerPool
-}
+func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.CreateAccountRequest) (*payments.CreateAccountResponse, error) {
+	result, err := s.circuitBreaker.Execute(func() (interface{}, error) {
+		tbAccount := convertGrpcAccountToTigerBeetleAccount(req.Account)
 
-type lookUpAccountServer struct {
-	payments.UnimplementedTransactionsLookUpServiceServer
-	lookupPool *LookUpAccountWorkerPool
-}
+		task := CreateAccountTask{
+			Task:   tbAccount,
+			Result: make(chan interface{}, 1),
+			Ctx:    ctx,
+		}
 
-func (wp *CreateAccountWorkerPool) SubmitTask(task CreateAccountTask) {
-	wp.tasks <- task
-}
-func (wp *CreateTransferWorkerPool) SubmitTask(task CreateTransferTask) {
-	wp.tasks <- task
-}
-func (wp *LookUpAccountWorkerPool) SubmitTask(task LookUpAccountTask) {
-	wp.tasks <- task
+		select {
+		case s.accountPool.tasks <- task:
+			// Task submitted successfully
+		default:
+			// Worker pool is full, implement backpressure
+			return nil, status.Errorf(codes.ResourceExhausted, "server is overloaded, please try again later")
+		}
+
+		select {
+		case result := <-task.Result:
+			close(task.Result)
+			switch v := result.(type) {
+			case error:
+				return nil, status.Errorf(codes.Internal, "failed to create account: %v", v)
+			case string:
+				return &payments.CreateAccountResponse{Results: v}, nil
+			default:
+				return nil, status.Errorf(codes.Internal, "unexpected result type")
+			}
+		case <-ctx.Done():
+			return nil, status.Errorf(codes.DeadlineExceeded, "request timed out")
+		}
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	response, ok := result.(*payments.CreateAccountResponse)
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "unexpected response type")
+	}
+
+	return response, nil
 }
 
 func main() {
@@ -205,34 +180,36 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// Create a circuit breaker
-	_ = gobreaker.NewCircuitBreaker(gobreaker.Settings{
-		Name:        "gRPC Circuit Breaker",
-		MaxRequests: 1000,             // Allow 1000 requests during the half-open state
-		Interval:    30 * time.Second, // Reset the failure count after this interval
-		Timeout:     10 * time.Second, // Timeout duration for the open state
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "CreateAccount Circuit Breaker",
+		MaxRequests: 100,
+		Interval:    5 * time.Second,
+		Timeout:     3 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 3 && failureRatio >= 0.6
+		},
 	})
 
-	// connect to Tiger-beetle here
+	// Connect to TigerBeetle
 	port := os.Getenv("TB_ADDRESS")
 	if port == "" {
 		port = "3000"
 	}
 
-	client, err := tigerbeetle_go.NewClient(ToUint128(0), []string{port}, 8192)
+	clientPool, err := NewTigerBeetleClientPool(runtime.NumCPU(), port)
 	if err != nil {
-		log.Fatalf("Error creating client: %s", err)
-	} else {
-		log.Println("Connected to Tigerbeetle")
+		log.Fatalf("Error creating TigerBeetle client pool: %s", err)
 	}
-	defer client.Close()
+	defer clientPool.Close()
 
-	// Create separate worker pools for each service
-	accountPool := NewCreateAccountWorkerPool(runtime.NumCPU(), 8190, client)
-	lookupPool := NewLookUpAccountWorkerPool(runtime.NumCPU(), 8190, client)
-	transferPool := NewCreateTransferWorkerPool(runtime.NumCPU(), 8190, client)
+	log.Println("Connected to TigerBeetle")
+
+	// Create worker pool
+	workerCount := runtime.NumCPU() * 2 // Adjust this based on your needs
+	taskQueueSize := 10000              // Adjust this based on your needs
+	accountPool := NewCreateAccountWorkerPool(workerCount, taskQueueSize, clientPool)
 	defer accountPool.Shutdown()
-	defer lookupPool.Shutdown()
-	defer transferPool.Shutdown()
 
 	grpcServerOptions := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(1000),
@@ -245,13 +222,8 @@ func main() {
 
 	grpcServer := grpc.NewServer(grpcServerOptions...)
 	payments.RegisterCreateAccountServiceServer(grpcServer, &createAccountServer{
-		accountPool: accountPool,
-	})
-	payments.RegisterCreateTransferServiceServer(grpcServer, &createTransferServer{
-		transferPool: transferPool,
-	})
-	payments.RegisterTransactionsLookUpServiceServer(grpcServer, &lookUpAccountServer{
-		lookupPool: lookupPool,
+		accountPool:    accountPool,
+		circuitBreaker: cb,
 	})
 	reflection.Register(grpcServer)
 
@@ -275,5 +247,4 @@ func main() {
 
 	grpcServer.GracefulStop()
 	log.Println("Server gracefully stopped")
-
 }

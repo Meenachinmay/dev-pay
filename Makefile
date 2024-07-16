@@ -21,3 +21,9 @@ down:
 
 run:
 	go run cmd/*.go
+
+runtb:
+	cd ../../.. && rm -rf 0_0.tigerbeetle && ./tigerbeetle format --cluster=0 --replica=0 --replica-count=1 0_0.tigerbeetle && ./tigerbeetle start --addresses=3000 0_0.tigerbeetle
+
+resettb:
+	cd ../../.. && rm -rf 0_0.tigerbeetle

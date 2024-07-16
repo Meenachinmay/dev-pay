@@ -19,8 +19,18 @@ import (
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+)
+
+var BATCH_SIZE = 8190
+
+const (
+	SmallBatchSize    = 500
+	LargeBatchSize    = 8190
+	SmallBatchTimeout = 50 * time.Millisecond
+	LargeBatchTimeout = 3 * time.Second
 )
 
 type CreateAccountTask struct {
@@ -70,6 +80,7 @@ type CreateAccountWorkerPool struct {
 	clientPool  *TigerBeetleClientPool
 	workerCount int
 	wg          sync.WaitGroup
+	requestRate int64
 }
 
 func NewCreateAccountWorkerPool(workerCount int, taskQueueSize int, clientPool *TigerBeetleClientPool) *CreateAccountWorkerPool {
@@ -84,29 +95,76 @@ func NewCreateAccountWorkerPool(workerCount int, taskQueueSize int, clientPool *
 		go wp.worker(i)
 	}
 
+	go wp.monitorRequestRate()
+
 	return wp
+}
+
+func (wp *CreateAccountWorkerPool) monitorRequestRate() {
+	ticker := time.NewTicker(time.Second)
+	var count int64
+	for range ticker.C {
+		atomic.StoreInt64(&wp.requestRate, count)
+		count = 0
+	}
 }
 
 func (wp *CreateAccountWorkerPool) worker(id int) {
 	defer wp.wg.Done()
-	for task := range wp.tasks {
-		client := wp.clientPool.GetClient()
+	var batch []Account
+	results := make([]chan interface{}, 0)
+
+	processBatch := func() {
+		if len(batch) > 0 {
+			wp.processBatch(batch, results)
+			batch = []Account{}
+			results = make([]chan interface{}, 0)
+		}
+	}
+
+	for {
 		select {
-		case <-task.Ctx.Done():
-			task.Result <- fmt.Errorf("task cancelled")
-		default:
-			res, err := client.CreateAccounts([]Account{*task.Task})
-			if err != nil {
-				task.Result <- fmt.Errorf("failed to create account due to TB client error: %v", err)
-				continue
+		case task, ok := <-wp.tasks:
+			if !ok {
+				processBatch()
+				return
+			}
+			atomic.AddInt64(&wp.requestRate, 1)
+			batch = append(batch, *task.Task)
+			results = append(results, task.Result)
+
+			batchSize := SmallBatchSize
+			timeout := SmallBatchTimeout
+			if atomic.LoadInt64(&wp.requestRate) > int64(wp.workerCount*SmallBatchSize) {
+				batchSize = LargeBatchSize
+				timeout = LargeBatchTimeout
 			}
 
-			if len(res) > 0 {
-				task.Result <- fmt.Errorf("error creating account %d: %s", res[0].Index, res[0].Result)
+			if len(batch) >= batchSize {
+				processBatch()
 			} else {
-				task.Result <- "Account created successfully"
+				time.AfterFunc(timeout, processBatch)
 			}
 		}
+	}
+}
+
+func (wp *CreateAccountWorkerPool) processBatch(batch []Account, results []chan interface{}) {
+	client := wp.clientPool.GetClient()
+
+	_, err := client.CreateAccounts(batch)
+	if err != nil {
+		log.Printf("Batch error: %v", err)
+		for _, resultChan := range results {
+			resultChan <- fmt.Errorf("failed to create accounts due to TB client error: %v", err)
+			close(resultChan) // Ensure channels are closed after writing to prevent leaks
+		}
+		return
+	}
+
+	for _, resultChan := range results {
+		resultChan <- "Account created successfully"
+		close(resultChan) // Ensure channels are closed after writing to prevent leaks
 	}
 }
 
@@ -127,6 +185,9 @@ type createAccountServer struct {
 	payments.UnimplementedCreateAccountServiceServer
 	accountPool    *CreateAccountWorkerPool
 	circuitBreaker *gobreaker.CircuitBreaker
+	accounts       []Account
+	accountResults map[string]chan string // Map to store results channels by batch
+	mu             sync.Mutex
 }
 
 func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.CreateAccountRequest) (*payments.CreateAccountResponse, error) {
@@ -143,13 +204,11 @@ func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.C
 		case s.accountPool.tasks <- task:
 			// Task submitted successfully
 		default:
-			// Worker pool is full, implement backpressure
 			return nil, status.Errorf(codes.ResourceExhausted, "server is overloaded, please try again later")
 		}
 
 		select {
 		case result := <-task.Result:
-			close(task.Result)
 			switch v := result.(type) {
 			case error:
 				return nil, status.Errorf(codes.Internal, "failed to create account: %v", v)
@@ -164,6 +223,7 @@ func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.C
 	})
 
 	if err != nil {
+		log.Printf("Create account error: %v", err)
 		return nil, err
 	}
 
@@ -182,8 +242,8 @@ func main() {
 	// Create a circuit breaker
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
 		Name:        "CreateAccount Circuit Breaker",
-		MaxRequests: 100,
-		Interval:    5 * time.Second,
+		MaxRequests: 8190,
+		Interval:    3 * time.Second,
 		Timeout:     3 * time.Second,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
 			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
@@ -224,6 +284,8 @@ func main() {
 	payments.RegisterCreateAccountServiceServer(grpcServer, &createAccountServer{
 		accountPool:    accountPool,
 		circuitBreaker: cb,
+		accounts:       make([]Account, 0),
+		accountResults: make(map[string]chan string),
 	})
 	reflection.Register(grpcServer)
 

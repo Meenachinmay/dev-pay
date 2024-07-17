@@ -46,6 +46,7 @@ message Transfer {
 // Service to create accounts
 service CreateAccountService {
   rpc CreateAccount(CreateAccountRequest) returns (CreateAccountResponse) {}
+  rpc CreateAccountBatch(CreateAccountBatchRequest) returns (CreateAccountBatchResponse) {}
 }
 
 message CreateAccountRequest {
@@ -54,6 +55,14 @@ message CreateAccountRequest {
 
 message CreateAccountResponse {
   string results = 1;
+}
+
+message CreateAccountBatchRequest {
+  repeated Account accounts = 1;
+}
+
+message CreateAccountBatchResponse {
+  repeated string results = 1;
 }
 
 // Service to lookup transactions/accounts

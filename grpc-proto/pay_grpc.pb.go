@@ -23,6 +23,7 @@ const _ = grpc.SupportPackageIsVersion7
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type CreateAccountServiceClient interface {
 	CreateAccount(ctx context.Context, in *CreateAccountRequest, opts ...grpc.CallOption) (*CreateAccountResponse, error)
+	CreateAccountBatch(ctx context.Context, in *CreateAccountBatchRequest, opts ...grpc.CallOption) (*CreateAccountBatchResponse, error)
 }
 
 type createAccountServiceClient struct {
@@ -42,11 +43,21 @@ func (c *createAccountServiceClient) CreateAccount(ctx context.Context, in *Crea
 	return out, nil
 }
 
+func (c *createAccountServiceClient) CreateAccountBatch(ctx context.Context, in *CreateAccountBatchRequest, opts ...grpc.CallOption) (*CreateAccountBatchResponse, error) {
+	out := new(CreateAccountBatchResponse)
+	err := c.cc.Invoke(ctx, "/payment.CreateAccountService/CreateAccountBatch", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // CreateAccountServiceServer is the server API for CreateAccountService service.
 // All implementations must embed UnimplementedCreateAccountServiceServer
 // for forward compatibility
 type CreateAccountServiceServer interface {
 	CreateAccount(context.Context, *CreateAccountRequest) (*CreateAccountResponse, error)
+	CreateAccountBatch(context.Context, *CreateAccountBatchRequest) (*CreateAccountBatchResponse, error)
 	mustEmbedUnimplementedCreateAccountServiceServer()
 }
 
@@ -56,6 +67,9 @@ type UnimplementedCreateAccountServiceServer struct {
 
 func (UnimplementedCreateAccountServiceServer) CreateAccount(context.Context, *CreateAccountRequest) (*CreateAccountResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateAccount not implemented")
+}
+func (UnimplementedCreateAccountServiceServer) CreateAccountBatch(context.Context, *CreateAccountBatchRequest) (*CreateAccountBatchResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateAccountBatch not implemented")
 }
 func (UnimplementedCreateAccountServiceServer) mustEmbedUnimplementedCreateAccountServiceServer() {}
 
@@ -88,6 +102,24 @@ func _CreateAccountService_CreateAccount_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _CreateAccountService_CreateAccountBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateAccountBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(CreateAccountServiceServer).CreateAccountBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/payment.CreateAccountService/CreateAccountBatch",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(CreateAccountServiceServer).CreateAccountBatch(ctx, req.(*CreateAccountBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // CreateAccountService_ServiceDesc is the grpc.ServiceDesc for CreateAccountService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -98,6 +130,10 @@ var CreateAccountService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateAccount",
 			Handler:    _CreateAccountService_CreateAccount_Handler,
+		},
+		{
+			MethodName: "CreateAccountBatch",
+			Handler:    _CreateAccountService_CreateAccountBatch_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

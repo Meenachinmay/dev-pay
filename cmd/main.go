@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -43,6 +44,41 @@ type createAccountServer struct {
 	workerWg      sync.WaitGroup
 	quit          chan struct{}
 	processedJobs int64
+}
+
+type TransferJob struct {
+	Transfer Transfer
+}
+
+type createTransferServer struct {
+	payments.UnimplementedCreateTransferServiceServer
+	client        tigerbeetle_go.Client
+	jobQueue      chan TransferJob
+	workerWg      sync.WaitGroup
+	quit          chan struct{}
+	processedJobs int64
+}
+
+func (s *createTransferServer) CreateTransfers(ctx context.Context, req *payments.CreateTransfersRequest) (*payments.CreateTransfersResponse, error) {
+	results := make([]string, len(req.Transfers))
+	for i, transfer := range req.Transfers {
+		tbTransfer := convertGrpcTransferToTigerBeetleTransfer(transfer)
+
+		select {
+		case s.jobQueue <- TransferJob{Transfer: tbTransfer}:
+			results[i] = "Transfer queued for creation"
+		default:
+			// Queue is full, wait a bit and try again
+			time.Sleep(10 * time.Millisecond)
+			select {
+			case s.jobQueue <- TransferJob{Transfer: tbTransfer}:
+				results[i] = "Transfer queued for creation after delay"
+			default:
+				results[i] = "Server overloaded, transfer creation failed"
+			}
+		}
+	}
+	return &payments.CreateTransfersResponse{Results: results}, nil
 }
 
 func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.CreateAccountRequest) (*payments.CreateAccountResponse, error) {
@@ -212,11 +248,107 @@ func (s *createAccountServer) worker(id int) {
 	}
 }
 
+func (s *createTransferServer) worker(id int) {
+	defer s.workerWg.Done()
+	log.Printf("Worker %d started", id)
+
+	batch := make([]Transfer, 0, BatchSize)
+	adaptiveMinBatchSize := MinBatchSize
+	tickerInterval := 500 * time.Millisecond
+
+	flushBatch := func() {
+		batchSize := len(batch)
+		if batchSize >= adaptiveMinBatchSize {
+			log.Printf("Worker %d flushing batch of size %d", id, batchSize)
+			_, cancel := context.WithTimeout(context.Background(), OpTimeout)
+			defer cancel()
+
+			start := time.Now()
+			_, err := s.client.CreateTransfers(batch)
+			duration := time.Since(start)
+
+			if err != nil {
+				log.Printf("Worker %d failed to create accounts: %v", id, err)
+
+				// IF error, reduce batch size to process smaller chunks
+				adaptiveMinBatchSize = max(adaptiveMinBatchSize/2, MinBatchSize)
+			} else {
+				atomic.AddInt64(&s.processedJobs, int64(batchSize))
+				// Adjust adaptive parameters based on performance
+				if duration < 200*time.Millisecond && adaptiveMinBatchSize < BatchSize {
+					adaptiveMinBatchSize = min(adaptiveMinBatchSize+1000, BatchSize)
+					tickerInterval = min(tickerInterval+100*time.Millisecond, 2*time.Second)
+				} else if duration > 500*time.Millisecond && adaptiveMinBatchSize > MinBatchSize {
+					adaptiveMinBatchSize = max(adaptiveMinBatchSize-1000, MinBatchSize)
+					tickerInterval = max(tickerInterval-100*time.Millisecond, 100*time.Millisecond)
+				}
+			}
+
+			batch = batch[:0]
+		}
+	}
+
+	ticker := time.NewTicker(tickerInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case job, ok := <-s.jobQueue:
+			if !ok {
+				if len(batch) > 0 {
+					_, cancel := context.WithTimeout(context.Background(), OpTimeout)
+					_, err := s.client.CreateTransfers(batch)
+					cancel()
+					if err != nil {
+						log.Printf("Worker %d failed to create final batch: %v", id, err)
+					} else {
+						atomic.AddInt64(&s.processedJobs, int64(len(batch)))
+					}
+				}
+				log.Printf("Worker %d shutting down", id)
+				return
+			}
+			batch = append(batch, job.Transfer)
+			if len(batch) >= BatchSize {
+				flushBatch()
+				ticker.Reset(tickerInterval)
+			}
+		case <-ticker.C:
+			flushBatch()
+			ticker.Reset(tickerInterval)
+		case <-s.quit:
+			if len(batch) > 0 {
+				_, cancel := context.WithTimeout(context.Background(), OpTimeout)
+				_, err := s.client.CreateTransfers(batch)
+				cancel()
+				if err != nil {
+					log.Printf("Worker %d failed to create final batch: %v", id, err)
+				} else {
+					atomic.AddInt64(&s.processedJobs, int64(len(batch)))
+				}
+			}
+			log.Printf("Worker %d received quit signal", id)
+			return
+		}
+	}
+}
+
 func convertGrpcAccountToTigerBeetleAccount(grpcAcc *payments.Account) Account {
 	return Account{
 		ID:     ToUint128(grpcAcc.Id),
 		Ledger: grpcAcc.Ledger,
 		Code:   uint16(grpcAcc.Code),
+	}
+}
+
+func convertGrpcTransferToTigerBeetleTransfer(grpcTransfer *payments.Transfer) Transfer {
+	return Transfer{
+		ID:              ToUint128(grpcTransfer.Id),
+		DebitAccountID:  ToUint128(grpcTransfer.DebitAccountId),
+		CreditAccountID: ToUint128(grpcTransfer.CreditAccountId),
+		Amount:          ToUint128(grpcTransfer.Amount),
+		Ledger:          grpcTransfer.Ledger,
+		Code:            uint16(grpcTransfer.Code),
 	}
 }
 
@@ -233,8 +365,98 @@ func main() {
 		log.Fatalf("Error creating TigerBeetle client: %s", err)
 	}
 	defer client.Close()
-
 	log.Println("Connected to TigerBeetle")
+
+	// Create two accounts
+	res, err := client.CreateAccounts([]Account{
+		{
+			ID:     ToUint128(1),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+		{
+			ID:     ToUint128(2),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+		{
+			ID:     ToUint128(3),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+		{
+			ID:     ToUint128(4),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+		{
+			ID:     ToUint128(7000000),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+		{
+			ID:     ToUint128(7000001),
+			Ledger: 1,
+			Code:   1,
+			Flags:  AccountFlags{}.ToUint16(), // No restrictions
+		},
+	})
+	if err != nil {
+		log.Fatalf("Error creating accounts: %s", err)
+	} else {
+		log.Println("Test Accounts created")
+	}
+
+	for _, err := range res {
+		log.Fatalf("Error creating account %d: %s", err.Index, err.Result)
+	}
+
+	// Check the sums for both accounts
+	_accounts, err := client.LookupAccounts([]Uint128{ToUint128(1), ToUint128(2), ToUint128(3), ToUint128(4)})
+	if err != nil {
+		log.Fatalf("Could not fetch accounts: %s", err)
+	}
+	assert(len(_accounts) == 4, "accounts")
+
+	transferRes, err := client.CreateTransfers([]Transfer{
+		{
+			ID:              ToUint128(7000000),
+			DebitAccountID:  ToUint128(7000000),
+			CreditAccountID: ToUint128(1),
+			Amount:          ToUint128(100000000),
+			Ledger:          1,
+			Code:            1,
+		},
+		{
+			ID:              ToUint128(7000001),
+			DebitAccountID:  ToUint128(7000001),
+			CreditAccountID: ToUint128(2),
+			Amount:          ToUint128(100000000),
+			Ledger:          1,
+			Code:            1,
+		},
+	})
+	if err != nil {
+		log.Fatalf("Error creating transfer: %s", err)
+	}
+
+	for _, err := range transferRes {
+		log.Fatalf("Error creating transfer: %s", err.Result)
+	}
+
+	// Check the sums for both accounts
+	accounts, err := client.LookupAccounts([]Uint128{ToUint128(1), ToUint128(2)})
+	if err != nil {
+		log.Fatalf("Could not fetch accounts: %s", err)
+	}
+	assert(len(accounts) == 2, "accounts")
+
+	fmt.Printf("Test Accounts status before load start %+v\n\n", accounts)
 
 	server := &createAccountServer{
 		client:   client,
@@ -245,6 +467,17 @@ func main() {
 	for i := 0; i < NumWorkers; i++ {
 		server.workerWg.Add(1)
 		go server.worker(i)
+	}
+
+	transferServer := &createTransferServer{
+		client:   client,
+		jobQueue: make(chan TransferJob, QueueSize),
+		quit:     make(chan struct{}),
+	}
+
+	for i := 0; i < NumWorkers; i++ {
+		transferServer.workerWg.Add(1)
+		go transferServer.worker(i)
 	}
 
 	grpcServerOptions := []grpc.ServerOption{
@@ -258,6 +491,7 @@ func main() {
 
 	grpcServer := grpc.NewServer(grpcServerOptions...)
 	payments.RegisterCreateAccountServiceServer(grpcServer, server)
+	payments.RegisterCreateTransferServiceServer(grpcServer, transferServer)
 	payments.RegisterTransactionsLookUpServiceServer(grpcServer, server)
 	reflection.Register(grpcServer)
 
@@ -274,6 +508,8 @@ func main() {
 	}()
 
 	go server.monitorProgress()
+	go transferServer.monitorProgress()
+	go verifyAccountBalances(client)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -289,6 +525,7 @@ func main() {
 
 }
 
+// monitor for create account service
 func (s *createAccountServer) monitorProgress() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -312,5 +549,58 @@ func (s *createAccountServer) monitorProgress() {
 		case <-s.quit:
 			return
 		}
+	}
+}
+
+// monitor for create transfer service
+func (s *createTransferServer) monitorProgress() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastProcessed int64
+	lastTime := time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			currentProcessed := atomic.LoadInt64(&s.processedJobs)
+			currentTime := time.Now()
+			duration := currentTime.Sub(lastTime)
+			rate := float64(currentProcessed-lastProcessed) / duration.Seconds()
+
+			log.Printf("Processed: %d, Queue size: %d, Processing rate: %.2f accounts/second",
+				currentProcessed, len(s.jobQueue), rate)
+
+			lastProcessed = currentProcessed
+			lastTime = currentTime
+		case <-s.quit:
+			return
+		}
+	}
+}
+
+func verifyAccountBalances(client tigerbeetle_go.Client) {
+	accountIDs := []Uint128{
+		ToUint128(1),
+		ToUint128(2),
+		ToUint128(3),
+		ToUint128(4),
+	}
+
+	accounts, err := client.LookupAccounts(accountIDs)
+	if err != nil {
+		log.Printf("Failed to lookup accounts: %v", err)
+		return
+	}
+
+	for _, account := range accounts {
+		log.Printf("Account %v: Credits Posted = %v, Debits Posted = %v",
+			account.ID, account.CreditsPosted, account.DebitsPosted)
+	}
+}
+
+func assert(condition bool, message string) {
+	if !condition {
+		log.Fatalf("Assertion failed: %s", message)
 	}
 }

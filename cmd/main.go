@@ -25,7 +25,7 @@ import (
 
 const (
 	BatchSize    = 8190
-	QueueSize    = 100000
+	QueueSize    = 1000000
 	NumWorkers   = 14
 	OpTimeout    = 5 * time.Second
 	MinBatchSize = 4000
@@ -66,15 +66,18 @@ func (s *createAccountServer) CreateAccountBatch(ctx context.Context, req *payme
 	for i, account := range req.Accounts {
 		tbAccount := convertGrpcAccountToTigerBeetleAccount(account)
 
-		job := AccountJob{
-			Account: tbAccount,
-		}
-
 		select {
-		case s.jobQueue <- job:
+		case s.jobQueue <- AccountJob{Account: tbAccount}:
 			results[i] = "Account queued for creation"
 		default:
-			results[i] = "Server overloaded, account creation failed"
+			// Queue is full, wait a bit and try again
+			time.Sleep(10 * time.Millisecond)
+			select {
+			case s.jobQueue <- AccountJob{Account: tbAccount}:
+				results[i] = "Account queued for creation after delay"
+			default:
+				results[i] = "Server overloaded, account creation failed"
+			}
 		}
 	}
 	return &payments.CreateAccountBatchResponse{Results: results}, nil
@@ -130,7 +133,7 @@ func (s *createAccountServer) worker(id int) {
 
 	batch := make([]Account, 0, BatchSize)
 	adaptiveMinBatchSize := MinBatchSize
-	tickerInterval := 2 * time.Second
+	tickerInterval := 500 * time.Millisecond
 
 	flushBatch := func() {
 		batchSize := len(batch)
@@ -145,15 +148,18 @@ func (s *createAccountServer) worker(id int) {
 
 			if err != nil {
 				log.Printf("Worker %d failed to create accounts: %v", id, err)
+
+				// IF error, reduce batch size to process smaller chunks
+				adaptiveMinBatchSize = max(adaptiveMinBatchSize/2, MinBatchSize)
 			} else {
 				atomic.AddInt64(&s.processedJobs, int64(batchSize))
 				// Adjust adaptive parameters based on performance
-				if duration < 500*time.Millisecond && adaptiveMinBatchSize < BatchSize {
-					adaptiveMinBatchSize = min(adaptiveMinBatchSize+500, BatchSize)
-					tickerInterval = min(tickerInterval+500*time.Millisecond, 5*time.Second)
-				} else if duration > 1*time.Second && adaptiveMinBatchSize > MinBatchSize {
-					adaptiveMinBatchSize = max(adaptiveMinBatchSize-500, MinBatchSize)
-					tickerInterval = max(tickerInterval-500*time.Millisecond, 1*time.Second)
+				if duration < 200*time.Millisecond && adaptiveMinBatchSize < BatchSize {
+					adaptiveMinBatchSize = min(adaptiveMinBatchSize+1000, BatchSize)
+					tickerInterval = min(tickerInterval+100*time.Millisecond, 2*time.Second)
+				} else if duration > 500*time.Millisecond && adaptiveMinBatchSize > MinBatchSize {
+					adaptiveMinBatchSize = max(adaptiveMinBatchSize-1000, MinBatchSize)
+					tickerInterval = max(tickerInterval-100*time.Millisecond, 100*time.Millisecond)
 				}
 			}
 
@@ -169,7 +175,9 @@ func (s *createAccountServer) worker(id int) {
 		case job, ok := <-s.jobQueue:
 			if !ok {
 				if len(batch) > 0 {
+					_, cancel := context.WithTimeout(context.Background(), OpTimeout)
 					_, err := s.client.CreateAccounts(batch)
+					cancel()
 					if err != nil {
 						log.Printf("Worker %d failed to create final batch: %v", id, err)
 					} else {
@@ -189,7 +197,9 @@ func (s *createAccountServer) worker(id int) {
 			ticker.Reset(tickerInterval)
 		case <-s.quit:
 			if len(batch) > 0 {
+				_, cancel := context.WithTimeout(context.Background(), OpTimeout)
 				_, err := s.client.CreateAccounts(batch)
+				cancel()
 				if err != nil {
 					log.Printf("Worker %d failed to create final batch: %v", id, err)
 				} else {
@@ -263,6 +273,8 @@ func main() {
 		}
 	}()
 
+	go server.monitorProgress()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -275,4 +287,30 @@ func main() {
 	server.workerWg.Wait()
 	log.Printf("Server gracefully stopped. Total accounts processed: %d", atomic.LoadInt64(&server.processedJobs))
 
+}
+
+func (s *createAccountServer) monitorProgress() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastProcessed int64
+	lastTime := time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			currentProcessed := atomic.LoadInt64(&s.processedJobs)
+			currentTime := time.Now()
+			duration := currentTime.Sub(lastTime)
+			rate := float64(currentProcessed-lastProcessed) / duration.Seconds()
+
+			log.Printf("Processed: %d, Queue size: %d, Processing rate: %.2f accounts/second",
+				currentProcessed, len(s.jobQueue), rate)
+
+			lastProcessed = currentProcessed
+			lastTime = currentTime
+		case <-s.quit:
+			return
+		}
+	}
 }

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,7 +25,7 @@ import (
 
 const (
 	BatchSize    = 8190
-	QueueSize    = 100000
+	QueueSize    = 1000000
 	NumWorkers   = 14
 	OpTimeout    = 5 * time.Second
 	MinBatchSize = 4000
@@ -35,10 +37,12 @@ type AccountJob struct {
 
 type createAccountServer struct {
 	payments.UnimplementedCreateAccountServiceServer
-	client   tigerbeetle_go.Client
-	jobQueue chan AccountJob
-	workerWg sync.WaitGroup
-	quit     chan struct{}
+	payments.UnimplementedTransactionsLookUpServiceServer
+	client        tigerbeetle_go.Client
+	jobQueue      chan AccountJob
+	workerWg      sync.WaitGroup
+	quit          chan struct{}
+	processedJobs int64
 }
 
 func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.CreateAccountRequest) (*payments.CreateAccountResponse, error) {
@@ -57,13 +61,79 @@ func (s *createAccountServer) CreateAccount(ctx context.Context, req *payments.C
 	}
 }
 
+func (s *createAccountServer) CreateAccountBatch(ctx context.Context, req *payments.CreateAccountBatchRequest) (*payments.CreateAccountBatchResponse, error) {
+	results := make([]string, len(req.Accounts))
+	for i, account := range req.Accounts {
+		tbAccount := convertGrpcAccountToTigerBeetleAccount(account)
+
+		select {
+		case s.jobQueue <- AccountJob{Account: tbAccount}:
+			results[i] = "Account queued for creation"
+		default:
+			// Queue is full, wait a bit and try again
+			time.Sleep(10 * time.Millisecond)
+			select {
+			case s.jobQueue <- AccountJob{Account: tbAccount}:
+				results[i] = "Account queued for creation after delay"
+			default:
+				results[i] = "Server overloaded, account creation failed"
+			}
+		}
+	}
+	return &payments.CreateAccountBatchResponse{Results: results}, nil
+}
+
+func (s *createAccountServer) LookupAccounts(ctx context.Context, req *payments.LookupAccountsRequest) (*payments.LookupAccountsResponse, error) {
+	tbAccountIDs := make([]Uint128, len(req.AccountIds))
+	for i, id := range req.AccountIds {
+		tbAccountIDs[i] = ToUint128(id)
+	}
+
+	accounts, err := s.client.LookupAccounts(tbAccountIDs)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to lookup accounts: %v", err)
+	}
+
+	response := &payments.LookupAccountsResponse{
+		Accounts: make([]*payments.AccountResponse, len(accounts)),
+	}
+
+	for i, account := range accounts {
+		response.Accounts[i] = &payments.AccountResponse{
+			Id:             convertUint128ToProto(account.ID),
+			DebitsPending:  convertUint128ToProto(account.DebitsPending),
+			DebitsPosted:   convertUint128ToProto(account.DebitsPosted),
+			CreditsPending: convertUint128ToProto(account.CreditsPending),
+			CreditsPosted:  convertUint128ToProto(account.CreditsPosted),
+			UserData128:    convertUint128ToProto(account.UserData128),
+			UserData64:     account.UserData64,
+			UserData32:     account.UserData32,
+			Reserved:       account.Reserved,
+			Ledger:         account.Ledger,
+			Code:           uint32(account.Code),
+			Flags:          uint32(account.Flags),
+			Timestamp:      account.Timestamp,
+		}
+	}
+
+	return response, nil
+}
+
+func convertUint128ToProto(value Uint128) *payments.Uint128 {
+	bytes := value.Bytes()
+	return &payments.Uint128{
+		High: binary.LittleEndian.Uint64(bytes[8:]),
+		Low:  binary.LittleEndian.Uint64(bytes[:8]),
+	}
+}
+
 func (s *createAccountServer) worker(id int) {
 	defer s.workerWg.Done()
 	log.Printf("Worker %d started", id)
 
 	batch := make([]Account, 0, BatchSize)
 	adaptiveMinBatchSize := MinBatchSize
-	tickerInterval := 2 * time.Second
+	tickerInterval := 500 * time.Millisecond
 
 	flushBatch := func() {
 		batchSize := len(batch)
@@ -78,14 +148,18 @@ func (s *createAccountServer) worker(id int) {
 
 			if err != nil {
 				log.Printf("Worker %d failed to create accounts: %v", id, err)
+
+				// IF error, reduce batch size to process smaller chunks
+				adaptiveMinBatchSize = max(adaptiveMinBatchSize/2, MinBatchSize)
 			} else {
+				atomic.AddInt64(&s.processedJobs, int64(batchSize))
 				// Adjust adaptive parameters based on performance
-				if duration < 500*time.Millisecond && adaptiveMinBatchSize < BatchSize {
-					adaptiveMinBatchSize = min(adaptiveMinBatchSize+500, BatchSize)
-					tickerInterval = min(tickerInterval+500*time.Millisecond, 5*time.Second)
-				} else if duration > 1*time.Second && adaptiveMinBatchSize > MinBatchSize {
-					adaptiveMinBatchSize = max(adaptiveMinBatchSize-500, MinBatchSize)
-					tickerInterval = max(tickerInterval-500*time.Millisecond, 1*time.Second)
+				if duration < 200*time.Millisecond && adaptiveMinBatchSize < BatchSize {
+					adaptiveMinBatchSize = min(adaptiveMinBatchSize+1000, BatchSize)
+					tickerInterval = min(tickerInterval+100*time.Millisecond, 2*time.Second)
+				} else if duration > 500*time.Millisecond && adaptiveMinBatchSize > MinBatchSize {
+					adaptiveMinBatchSize = max(adaptiveMinBatchSize-1000, MinBatchSize)
+					tickerInterval = max(tickerInterval-100*time.Millisecond, 100*time.Millisecond)
 				}
 			}
 
@@ -101,9 +175,13 @@ func (s *createAccountServer) worker(id int) {
 		case job, ok := <-s.jobQueue:
 			if !ok {
 				if len(batch) > 0 {
+					_, cancel := context.WithTimeout(context.Background(), OpTimeout)
 					_, err := s.client.CreateAccounts(batch)
+					cancel()
 					if err != nil {
 						log.Printf("Worker %d failed to create final batch: %v", id, err)
+					} else {
+						atomic.AddInt64(&s.processedJobs, int64(len(batch)))
 					}
 				}
 				log.Printf("Worker %d shutting down", id)
@@ -119,9 +197,13 @@ func (s *createAccountServer) worker(id int) {
 			ticker.Reset(tickerInterval)
 		case <-s.quit:
 			if len(batch) > 0 {
+				_, cancel := context.WithTimeout(context.Background(), OpTimeout)
 				_, err := s.client.CreateAccounts(batch)
+				cancel()
 				if err != nil {
 					log.Printf("Worker %d failed to create final batch: %v", id, err)
+				} else {
+					atomic.AddInt64(&s.processedJobs, int64(len(batch)))
 				}
 			}
 			log.Printf("Worker %d received quit signal", id)
@@ -176,6 +258,7 @@ func main() {
 
 	grpcServer := grpc.NewServer(grpcServerOptions...)
 	payments.RegisterCreateAccountServiceServer(grpcServer, server)
+	payments.RegisterTransactionsLookUpServiceServer(grpcServer, server)
 	reflection.Register(grpcServer)
 
 	listener, err := net.Listen("tcp", ":50051")
@@ -190,6 +273,8 @@ func main() {
 		}
 	}()
 
+	go server.monitorProgress()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -200,5 +285,32 @@ func main() {
 	grpcServer.GracefulStop()
 	close(server.jobQueue)
 	server.workerWg.Wait()
-	log.Println("Server gracefully stopped")
+	log.Printf("Server gracefully stopped. Total accounts processed: %d", atomic.LoadInt64(&server.processedJobs))
+
+}
+
+func (s *createAccountServer) monitorProgress() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	var lastProcessed int64
+	lastTime := time.Now()
+
+	for {
+		select {
+		case <-ticker.C:
+			currentProcessed := atomic.LoadInt64(&s.processedJobs)
+			currentTime := time.Now()
+			duration := currentTime.Sub(lastTime)
+			rate := float64(currentProcessed-lastProcessed) / duration.Seconds()
+
+			log.Printf("Processed: %d, Queue size: %d, Processing rate: %.2f accounts/second",
+				currentProcessed, len(s.jobQueue), rate)
+
+			lastProcessed = currentProcessed
+			lastTime = currentTime
+		case <-s.quit:
+			return
+		}
+	}
 }
